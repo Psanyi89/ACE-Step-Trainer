@@ -30,7 +30,7 @@ def get_spacy_lang(lang):
     elif lang == "es":
         return Spanish()
     else:
-        # For most languages, Enlish does the job
+        # For most languages, English does the job
         return English()
 
 

@@ -85,6 +85,12 @@ def dump_func(*args):
     print(args)
     return []
 
+def get_lora_choices_fullpath():
+    base_dir = r".\Loras"  # LoRA folder path
+    # List only directories inside the LoRA folder
+    dirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+    # Add "none" option
+    return dirs + ["none"]
 
 def create_text2music_ui(
     gr,
@@ -127,7 +133,7 @@ def create_text2music_ui(
                 audio2audio_enable = gr.Checkbox(label="Enable Audio2Audio", value=False, info="Check to enable Audio-to-Audio generation using a reference audio.", elem_id="audio2audio_checkbox")
                 lora_name_or_path = gr.Dropdown(
                     label="Lora Name or Path",
-                    choices=["ACE-Step/ACE-Step-v1-chinese-rap-LoRA", "none"],
+                    choices=get_lora_choices_fullpath(),
                     value="none",
                     allow_custom_value=True,
                     min_width=300

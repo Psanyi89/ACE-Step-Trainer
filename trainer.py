@@ -1,9 +1,12 @@
+import platform
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning import Trainer
+from pytorch_lightning.strategies import DDPStrategy
 from datetime import datetime
 import argparse
 import torch
+import torch.distributed as dist
 import json
 import matplotlib
 import torch.nn.functional as F
@@ -82,9 +85,16 @@ class Pipeline(LightningModule):
             lora_config = LoraConfig(**lora_config)
             transformers.add_adapter(adapter_config=lora_config, adapter_name=adapter_name)
             self.adapter_name = adapter_name
+            # Freeze everything
+            for name, param in transformers.named_parameters():
+                param.requires_grad = False
 
-        self.transformers = transformers
-
+            # Unfreeze LoRA parameters (correct way)
+            for name, param in transformers.named_parameters():
+                if "lora" in name.lower():      # matches lora_A, lora_B, etc.
+                    param.requires_grad = True
+                    
+            self.transformers = transformers
         self.dcae = acestep_pipeline.music_dcae.float().cpu()
         self.dcae.requires_grad_(False)
 
@@ -486,7 +496,10 @@ class Pipeline(LightningModule):
         return timesteps
 
     def run_step(self, batch, batch_idx):
+
+        # plot/predict WITHOUT touching the graph
         self.plot_step(batch, batch_idx)
+
         (
             keys,
             target_latents,
@@ -540,7 +553,7 @@ class Pipeline(LightningModule):
         )
         model_pred = transformer_output.sample
         proj_losses = transformer_output.proj_losses
-
+        
         # Follow: Section 5 of https://arxiv.org/abs/2206.00364.
         # Preconditioning of the model outputs.
         model_pred = model_pred * (-sigmas) + noisy_image
@@ -555,12 +568,16 @@ class Pipeline(LightningModule):
         )
 
         selected_model_pred = (model_pred * mask).reshape(bsz, -1).contiguous()
-        selected_target = (target * mask).reshape(bsz, -1).contiguous()
-
+        selected_target = (target * mask).reshape(bsz, -1).contiguous()      
         loss = F.mse_loss(selected_model_pred, selected_target, reduction="none")
         loss = loss.mean(1)
         loss = loss * mask.reshape(bsz, -1).mean(1)
         loss = loss.mean()
+
+        # NOW it is legal to inspect gradients
+        print("model_pred.requires_grad:", model_pred.requires_grad)
+        print("selected_model_pred.requires_grad:", selected_model_pred.requires_grad)
+        print("loss.requires_grad:", loss.requires_grad)
 
         prefix = "train"
 
@@ -711,8 +728,17 @@ class Pipeline(LightningModule):
             )[0]
 
         return target_latents
-
+    
+    @torch.no_grad()
     def predict_step(self, batch):
+        """
+        Inference that is safe to call from training. Runs entirely under no_grad()
+        and restores the transformer's training state afterwards.
+        """
+        # preserve training state and switch to eval
+        was_training = self.transformers.training
+        self.transformers.eval()
+
         (
             keys,
             target_latents,
@@ -756,6 +782,11 @@ class Pipeline(LightningModule):
         sr, pred_wavs = self.dcae.decode(
             pred_latents, audio_lengths=audio_lengths, sr=48000
         )
+        
+        # restore training state
+        if was_training:
+            self.transformers.train()
+        
         return {
             "target_wavs": batch["target_wavs"],
             "pred_wavs": pred_wavs,
@@ -776,15 +807,25 @@ class Pipeline(LightningModule):
 
     def plot_step(self, batch, batch_idx):
         global_step = self.global_step
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            
+        # Run prediction safely (no_grad + eval) and always produce `results`
+        results = None
+        with torch.no_grad():
+            # predict_step already handles eval/train state and no_grad, but this extra
+            # context is harmless and defensive
+            results = self.predict_step(batch)
+        
+         # If not a logging step, return only prediction results
         if (
             global_step % self.hparams.every_plot_step != 0
             or self.local_rank != 0
-            or torch.distributed.get_rank() != 0
+            or rank != 0
             or torch.cuda.current_device() != 0
         ):
-            return
-        results = self.predict_step(batch)
+            return results
 
+        # Now we DEFINITELY have `results`    
         target_wavs = results["target_wavs"]
         pred_wavs = results["pred_wavs"]
         keys = results["keys"]
@@ -815,7 +856,7 @@ class Pipeline(LightningModule):
             ) as f:
                 f.write(key_prompt_lyric)
             i += 1
-
+        return results
 
 def main(args):
     model = Pipeline(
@@ -845,7 +886,7 @@ def main(args):
         num_nodes=args.num_nodes,
         precision=args.precision,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        strategy="ddp_find_unused_parameters_true",
+        strategy="auto" or None,
         max_epochs=args.epochs,
         max_steps=args.max_steps,
         log_every_n_steps=1,

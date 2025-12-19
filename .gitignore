@@ -4,7 +4,13 @@
 t5_g2p_model/
 embeddings/
 checkpoints/
-
+.gradio/
+Loras/
+*_dataset/
+!config/zh_rap_lora_config.json
+config/*_lora_config.json
+data/
+models--ACE-Step--ACE-Step-v1-*/
 val_images/
 val_audios/
 lightning_logs/

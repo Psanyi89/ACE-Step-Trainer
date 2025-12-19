@@ -1413,22 +1413,74 @@ class ACEStepPipeline:
         return latents
 
     def load_lora(self, lora_name_or_path, lora_weight):
-        if (lora_name_or_path != self.lora_path or lora_weight != self.lora_weight) and lora_name_or_path != "none":
-            if not os.path.exists(lora_name_or_path):
-                lora_download_path = snapshot_download(lora_name_or_path, cache_dir=self.checkpoint_dir)
-            else:
-                lora_download_path = lora_name_or_path
+        # ---- NO LORA SELECTED ----
+        if not lora_name_or_path or lora_name_or_path == "none":
+            logger.info("No lora weights to load. Using base model.")
+    
             if self.lora_path != "none":
+                try:
+                    self.ace_step_transformer.unload_lora()
+                    if hasattr(self.ace_step_transformer, "peft_config"):
+                        self.ace_step_transformer.peft_config.pop("ace_step_lora", None)
+                except Exception as e:
+                    logger.warning(f"Failed to unload LoRA: {e}")
+    
+            self.lora_path = "none"
+            self.lora_weight = 0.0
+            return
+    
+        # ---- SAME LORA & SAME WEIGHT → DO NOTHING ----
+        if lora_name_or_path == self.lora_path and lora_weight == self.lora_weight:
+            return
+    
+        # ---- SWITCHING LORA → UNLOAD FIRST ----
+        if self.lora_path != "none":
+            try:
                 self.ace_step_transformer.unload_lora()
-            self.ace_step_transformer.load_lora_adapter(os.path.join(lora_download_path, "pytorch_lora_weights.safetensors"), adapter_name="ace_step_lora", with_alpha=True, prefix=None)
-            logger.info(f"Loading lora weights from: {lora_name_or_path} download path is: {lora_download_path} weight: {lora_weight}")
-            set_weights_and_activate_adapters(self.ace_step_transformer, ["ace_step_lora"], [lora_weight])
-            self.lora_path = lora_name_or_path
-            self.lora_weight = lora_weight
-        elif self.lora_path != "none" and lora_name_or_path == "none":
-            logger.info("No lora weights to load.")
-            self.ace_step_transformer.unload_lora()
-
+                if hasattr(self.ace_step_transformer, "peft_config"):
+                    self.ace_step_transformer.peft_config.pop("ace_step_lora", None)
+            except Exception as e:
+                logger.warning(f"Failed to unload previous LoRA: {e}")
+    
+        # ---- RESOLVE LORA PATH ----
+        if os.path.isfile(lora_name_or_path):
+            lora_dir = os.path.dirname(lora_name_or_path)
+        elif os.path.exists(os.path.join("Loras", lora_name_or_path)):
+            lora_dir = os.path.join("Loras", lora_name_or_path)
+        elif os.path.exists(lora_name_or_path):
+            lora_dir = lora_name_or_path
+        else:
+            lora_dir = snapshot_download(
+                lora_name_or_path,
+                cache_dir=self.checkpoint_dir
+            )
+    
+        weights_path = os.path.join(lora_dir, "pytorch_lora_weights.safetensors")
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(f"LoRA weights not found: {weights_path}")
+    
+        # ---- LOAD NEW LORA ----
+        self.ace_step_transformer.load_lora_adapter(
+            weights_path,
+            adapter_name="ace_step_lora",
+            with_alpha=True,
+            prefix=None
+        )
+    
+        set_weights_and_activate_adapters(
+            self.ace_step_transformer,
+            ["ace_step_lora"],
+            [lora_weight]
+        )
+    
+        logger.info(
+            f"Loaded LoRA: {lora_name_or_path} "
+            f"(path={lora_dir}, weight={lora_weight})"
+        )
+    
+        self.lora_path = lora_name_or_path
+        self.lora_weight = lora_weight
+    
     def __call__(
         self,
         format: str = "wav",
